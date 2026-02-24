@@ -1,0 +1,555 @@
+# ============================================
+#Convolutional Neural Network Based on EfficienNetB0
+# ============================================
+
+!pip install kagglehub
+
+# Import libraries
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, models
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+import kagglehub
+import shutil
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# ============================================
+# 1. DATASET
+# ============================================
+
+print("="*50)
+print("DOWNLOADING BRAIN TUMOR DATASET")
+print("="*50)
+
+# Download dataset
+path = kagglehub.dataset_download("sartajbhuvaji/brain-tumor-classification-mri")
+print(f"Dataset downloaded to: {path}")
+
+# Explore directory structure
+print("\nDataset structure:")
+!ls {path}
+
+# The dataset has two main folders: Training and Testing
+# Let's examine the content
+print("\nTraining folder contents:")
+!ls {path}/Training
+
+print("\nTesting folder contents:")
+!ls {path}/Testing
+
+# ============================================
+# 2. ORGANIZE DATA FOR STRATIFIED SPLIT
+# ============================================
+
+print("\n" + "="*50)
+print("ORGANIZING DATA FOR STRATIFIED SPLIT")
+print("="*50)
+
+# Create directory for organized data
+base_dir = '/content/brain_tumor_organized'
+if os.path.exists(base_dir):
+    shutil.rmtree(base_dir)
+os.makedirs(base_dir, exist_ok=True)
+
+# Define tumor classes
+classes = ['glioma_tumor', 'meningioma_tumor', 'pituitary_tumor', 'no_tumor'] # Corrected class names
+class_names = ['Glioma Tumor', 'Meningioma Tumor', 'Pituitary Tumor', 'No Tumor'] # Corrected class names for display
+
+# Function to collect all image paths and labels
+def collect_images():
+    images = []
+    labels = []
+
+    # Collect from Training folder
+    train_path = os.path.join(path, 'Training')
+    for class_name in classes:
+        class_path = os.path.join(train_path, class_name)
+        if os.path.exists(class_path):
+            for img_file in os.listdir(class_path):
+                if img_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    images.append(os.path.join(class_path, img_file))
+                    labels.append(class_name)
+
+    # Collect from Testing folder
+    test_path = os.path.join(path, 'Testing')
+    for class_name in classes:
+        class_path = os.path.join(test_path, class_name)
+        if os.path.exists(class_path):
+            for img_file in os.listdir(class_path):
+                if img_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    images.append(os.path.join(class_path, img_file))
+                    labels.append(class_name)
+
+    return np.array(images), np.array(labels)
+
+# Collect all images
+all_images, all_labels = collect_images()
+print(f"Total images collected: {len(all_images)}")
+
+# Count images per class
+unique, counts = np.unique(all_labels, return_counts=True)
+for cls, count in zip(unique, counts):
+    print(f"  {cls}: {count} images")
+
+# ============================================
+# 3. STRATIFIED HOLD-OUT SPLIT (80-10-10)
+# ============================================
+
+print("\n" + "="*50)
+print("PERFORMING STRATIFIED SPLIT (80% train, 10% val, 10% test)")
+print("="*50)
+
+# First split: separate 80% training and 20% temporary
+X_train_full, X_test_val, y_train_full, y_test_val = train_test_split(
+    all_images, all_labels,
+    test_size=0.2,  # 20% for test and validation combined
+    stratify=all_labels,
+    random_state=42
+)
+
+# Split the 20% into 10% validation and 10% test
+X_val, X_test, y_val, y_test = train_test_split(
+    X_test_val, y_test_val,
+    test_size=0.5,  # 50% of the 20% (i.e., 10% of total) for test
+    stratify=y_test_val,
+    random_state=42
+)
+
+X_train, y_train = X_train_full, y_train_full
+
+print(f"\nTraining set: {len(X_train)} images")
+print(f"Validation set: {len(X_val)} images")
+print(f"Test set: {len(X_test)} images")
+
+# Verify class distribution in test set
+test_counts = np.unique(y_test, return_counts=True)
+print("\nTest set composition:")
+for cls, count in zip(test_counts[0], test_counts[1]):
+    print(f"  {cls}: {count} images")
+
+print("\nExpected test set composition:")
+
+
+# glioma_tumor: 926 * 0.1 = 92.6 -> ~92 or 93
+# meningioma_tumor: 937 * 0.1 = 93.7 -> ~93 or 94
+# no_tumor: 500 * 0.1 = 50
+# pituitary_tumor: 901 * 0.1 = 90.1 -> ~90
+print("  glioma_tumor: approx 93")
+print("  meningioma_tumor: approx 94")
+print("  pituitary_tumor: approx 90")
+print("  no_tumor: approx 50")
+
+
+# ============================================
+# 4. CREATE DIRECTORY STRUCTURE FOR DATA GENERATORS
+# ============================================
+
+print("\n" + "="*50)
+print("CREATING DIRECTORY STRUCTURE")
+print("="*50)
+
+# Create directories
+for split in ['train', 'val', 'test']:
+    split_dir = os.path.join(base_dir, split)
+    for class_name in classes:
+        os.makedirs(os.path.join(split_dir, class_name), exist_ok=True)
+
+# Function to copy images to respective directories
+def copy_images_to_split(image_paths, labels, split_name):
+    for img_path, label in zip(image_paths, labels):
+        dest_dir = os.path.join(base_dir, split_name, label)
+        dest_path = os.path.join(dest_dir, os.path.basename(img_path))
+        # Handle duplicate filenames
+        if os.path.exists(dest_path):
+            base, ext = os.path.splitext(os.path.basename(img_path))
+            counter = 1
+            while os.path.exists(dest_path):
+                new_filename = f"{base}_{counter}{ext}"
+                dest_path = os.path.join(dest_dir, new_filename)
+                counter += 1
+        shutil.copy2(img_path, dest_path)
+
+# Copy images to respective splits
+print("Copying training images...")
+copy_images_to_split(X_train, y_train, 'train')
+
+print("Copying validation images...")
+copy_images_to_split(X_val, y_val, 'val')
+
+print("Copying test images...")
+copy_images_to_split(X_test, y_test, 'test')
+
+print("Image copying completed!")
+
+# ============================================
+# 5. DATA PREPROCESSING AND AUGMENTATION
+# ============================================
+
+print("\n" + "="*50)
+print("SETTING UP DATA GENERATORS")
+print("="*50)
+
+# Image parameters
+IMG_SIZE = 224  # EfficientNetB0 expects 224x224 images
+BATCH_SIZE = 32
+
+# Data augmentation for training
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    rotation_range=20,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+
+# Only rescaling for validation and test
+val_test_datagen = ImageDataGenerator(rescale=1./255)
+
+# Create generators
+train_generator = train_datagen.flow_from_directory(
+    os.path.join(base_dir, 'train'),
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    shuffle=True,
+    classes=classes
+)
+
+validation_generator = val_test_datagen.flow_from_directory(
+    os.path.join(base_dir, 'val'),
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    shuffle=False,
+    classes=classes
+)
+
+test_generator = val_test_datagen.flow_from_directory(
+    os.path.join(base_dir, 'test'),
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    shuffle=False,
+    classes=classes
+)
+
+print(f"\nClass indices: {train_generator.class_indices}")
+
+# ============================================
+# 6. BUILD EFFICIENTNETB0 MODEL
+# ============================================
+
+print("\n" + "="*50)
+print("BUILDING EFFICIENTNETB0 MODEL")
+print("="*50)
+
+def create_efficientnet_model(num_classes=4):
+    # Load pre-trained EfficientNetB0 without top layers
+    base_model = EfficientNetB0(
+        weights='imagenet',
+        include_top=False,
+        input_shape=(IMG_SIZE, IMG_SIZE, 3)
+    )
+
+    # Freeze the base model layers initially
+    base_model.trainable = False
+
+    # Create new model on top
+    inputs = keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+
+    # Data augmentation layer (only during training)
+    x = inputs
+
+    # Base model
+    x = base_model(x, training=False)
+
+    # Global average pooling
+    x = layers.GlobalAveragePooling2D()(x)
+
+    # Dropout for regularization
+    x = layers.Dropout(0.3)(x)
+
+    # Dense layers
+    x = layers.Dense(512, activation='relu')(x)
+    x = layers.Dropout(0.5)(x)
+
+    # Output layer
+    outputs = layers.Dense(num_classes, activation='softmax')(x)
+
+    model = keras.Model(inputs, outputs)
+
+    return model, base_model
+
+# Create model
+model, base_model = create_efficientnet_model(num_classes=4)
+model.summary()
+
+# ============================================
+# 7. COMPILE AND TRAIN MODEL (STAGE 1)
+# ============================================
+
+print("\n" + "="*50)
+print("STAGE 1: TRAINING TOP LAYERS")
+print("="*50)
+
+# Compile model
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=0.001),
+    loss='categorical_crossentropy',
+    metrics=['accuracy', keras.metrics.AUC(), keras.metrics.Precision(), keras.metrics.Recall()]
+)
+
+# Callbacks
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
+    ModelCheckpoint('best_model_stage1.keras', monitor='val_accuracy', save_best_only=True, verbose=1),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-7, verbose=1)
+]
+
+# Calculate steps per epoch
+steps_per_epoch = train_generator.samples // BATCH_SIZE
+validation_steps = validation_generator.samples // BATCH_SIZE
+
+# Train the top layers
+history_stage1 = model.fit(
+    train_generator,
+    steps_per_epoch=steps_per_epoch,
+    epochs=30,
+    validation_data=validation_generator,
+    validation_steps=validation_steps,
+    callbacks=callbacks,
+    verbose=1
+)
+
+# ============================================
+# 8. FINE-TUNING (STAGE 2)
+# ============================================
+
+print("\n" + "="*50)
+print("STAGE 2: FINE-TUNING")
+print("="*50)
+
+# Unfreeze the base model
+base_model.trainable = True
+
+# Freeze early layers, fine-tune later layers
+for layer in base_model.layers[:100]:
+    layer.trainable = False
+
+# Recompile with lower learning rate
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=0.0001),
+    loss='categorical_crossentropy',
+    metrics=['accuracy', keras.metrics.AUC(), keras.metrics.Precision(), keras.metrics.Recall()]
+)
+
+# Callbacks for fine-tuning
+callbacks_ft = [
+    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
+    ModelCheckpoint('best_model_finetuned.keras', monitor='val_accuracy', save_best_only=True, verbose=1),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-8, verbose=1)
+]
+
+# Continue training
+history_stage2 = model.fit(
+    train_generator,
+    steps_per_epoch=steps_per_epoch,
+    epochs=30,
+    validation_data=validation_generator,
+    validation_steps=validation_steps,
+    callbacks=callbacks_ft,
+    verbose=1
+)
+
+# Load the best model from fine-tuning
+model.load_weights('best_model_finetuned.keras')
+
+# ============================================
+# 9. EVALUATE ON TEST SET
+# ============================================
+
+print("\n" + "="*50)
+print("EVALUATING ON TEST SET")
+print("="*50)
+
+# Evaluate on test set
+test_loss, test_accuracy, test_auc, test_precision, test_recall = model.evaluate(test_generator, verbose=1)
+
+print(f"\nTest Results:")
+print(f"  Loss: {test_loss:.4f}")
+print(f"  Accuracy: {test_accuracy:.4f}")
+print(f"  AUC: {test_auc:.4f}")
+print(f"  Precision: {test_precision:.4f}")
+print(f"  Recall: {test_recall:.4f}")
+print(f"  F1-Score: {2 * (test_precision * test_recall) / (test_precision + test_recall):.4f}")
+
+# ============================================
+# 10. CONFUSION MATRIX AND CLASSIFICATION REPORT
+# ============================================
+
+print("\n" + "="*50)
+print("GENERATING CONFUSION MATRIX AND CLASSIFICATION REPORT")
+print("="*50)
+
+# Reset test generator
+test_generator.reset()
+
+# Predict on test set
+predictions = model.predict(test_generator, verbose=1)
+predicted_classes = np.argmax(predictions, axis=1)
+true_classes = test_generator.classes
+
+# Confusion Matrix
+cm = confusion_matrix(true_classes, predicted_classes)
+
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=class_names, yticklabels=class_names)
+plt.title('Confusion Matrix - Test Set', fontsize=16)
+plt.xlabel('Predicted Label', fontsize=12)
+plt.ylabel('True Label', fontsize=12)
+plt.tight_layout()
+plt.savefig('confusion_matrix.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# Classification Report
+report = classification_report(true_classes, predicted_classes,
+                              target_names=class_names, output_dict=True)
+report_df = pd.DataFrame(report).transpose()
+print("\nClassification Report:")
+print(report_df)
+
+# Save report
+report_df.to_csv('classification_report.csv')
+
+# ============================================
+# 11. PLOT TRAINING HISTORY
+# ============================================
+
+print("\n" + "="*50)
+print("PLOTTING TRAINING HISTORY")
+print("="*50)
+
+# Combine histories
+history = {}
+for key in history_stage1.history.keys():
+    history[key] = history_stage1.history[key] + history_stage2.history[key]
+
+# Plot training history
+fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+
+# Accuracy plot
+axes[0].plot(history['accuracy'], label='Train Accuracy', linewidth=2)
+axes[0].plot(history['val_accuracy'], label='Validation Accuracy', linewidth=2)
+axes[0].axvline(x=len(history_stage1.history['accuracy']), color='red', linestyle='--', label='Fine-tuning start')
+axes[0].set_title('Model Accuracy', fontsize=14)
+axes[0].set_xlabel('Epoch', fontsize=12)
+axes[0].set_ylabel('Accuracy', fontsize=12)
+axes[0].legend(fontsize=10)
+axes[0].grid(True, alpha=0.3)
+
+# Loss plot
+axes[1].plot(history['loss'], label='Train Loss', linewidth=2)
+axes[1].plot(history['val_loss'], label='Validation Loss', linewidth=2)
+axes[1].axvline(x=len(history_stage1.history['loss']), color='red', linestyle='--', label='Fine-tuning start')
+axes[1].set_title('Model Loss', fontsize=14)
+axes[1].set_xlabel('Epoch', fontsize=12)
+axes[1].set_ylabel('Loss', fontsize=12)
+axes[1].legend(fontsize=10)
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ============================================
+# 12. SAVE MODEL AND RESULTS
+# ============================================
+
+print("\n" + "="*50)
+print("SAVING MODEL AND RESULTS")
+print("="*50)
+
+# Save final model
+model.save('brain_tumor_efficientnet_final.keras')
+model.save('brain_tumor_efficientnet_final.h5')
+
+# Save class indices
+import json
+with open('class_indices.json', 'w') as f:
+    json.dump(train_generator.class_indices, f)
+
+print("\n✅ Model and results saved successfully!")
+print("\nFiles saved:")
+print("  - brain_tumor_efficientnet_final.keras (Keras format)")
+print("  - brain_tumor_efficientnet_final.h5 (H5 format)")
+print("  - class_indices.json")
+print("  - confusion_matrix.png")
+print("  - training_history.png")
+print("  - classification_report.csv")
+
+# ============================================
+# 13. SAMPLE PREDICTIONS
+# ============================================
+
+print("\n" + "="*50)
+print("SAMPLE PREDICTIONS FROM TEST SET")
+print("="*50)
+
+# Function to display sample predictions
+def display_sample_predictions(model, generator, class_names, num_samples=8):
+    # Reset generator
+    generator.reset()
+
+    # Get batch of images
+    images, labels = next(generator)
+
+    # Make predictions
+    predictions = model.predict(images, verbose=0)
+    pred_classes = np.argmax(predictions, axis=1)
+    true_classes = np.argmax(labels, axis=1)
+
+    # Display images with predictions
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    axes = axes.ravel()
+
+    for i in range(min(num_samples, len(images))):
+        axes[i].imshow(images[i])
+        axes[i].axis('off')
+
+        true_label = class_names[true_classes[i]]
+        pred_label = class_names[pred_classes[i]]
+        confidence = predictions[i][pred_classes[i]]
+
+        color = 'green' if true_classes[i] == pred_classes[i] else 'red'
+        title = f'True: {true_label}\nPred: {pred_label}\nConf: {confidence:.2f}'
+        axes[i].set_title(title, color=color, fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig('sample_predictions.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+# Display sample predictions
+display_sample_predictions(model, test_generator, class_names)
+
+print("\n" + "="*50)
+print("PROJECT COMPLETED SUCCESSFULLY!")
+print("="*50)
